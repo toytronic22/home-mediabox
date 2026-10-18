@@ -1,0 +1,109 @@
+on property:sys.boot_completed=1
+    # Самолечение зависаний. 09.09.2026 приставка встала колом на шесть часов:
+    # ядро было живо (отвечало на ping), а все процессы намертво ждали винчестер,
+    # и поднять её смог только человек, выдернувший питание. Аппаратный сторож тут
+    # бесполезен — его кормит сам ядерный поток watchdogd, и с точки зрения железа
+    # всё было в порядке. Зато у ядра есть детектор зависших задач: если задача
+    # ждёт диск дольше 15 минут подряд, ядро вызывает панику, а panic=-1 означает
+    # немедленную перезагрузку. Пятнадцать минут вместо шести часов.
+    #
+    # Почему 15, а не 10, как у сторожа: это ПОСЛЕДНИЙ рубеж, и он должен
+    # срабатывать заведомо позже сторожа — тот уходит мягко, со сбросом кэша
+    # на диск, а тут просто падает ядро. Пересечься они могут легко, потому что
+    # отсчёты начинаются в разные моменты: сторож считает от просадки памяти,
+    # ядро — от того мига, когда задача вошла в ожидание диска, а это раньше.
+    # Пяти минут разницы хватает, чтобы порядок не перепутался.
+    #
+    # Побочный риск: при очень тяжёлой дисковой операции возможна ложная
+    # перезагрузка — потеряется до полуминуты прогресса закачки, не больше.
+    write /proc/sys/kernel/hung_task_timeout_secs 900
+    write /proc/sys/kernel/hung_task_panic 1
+
+    start extmount
+    start qbt
+    start fileweb
+    start dlwatch
+    start health
+    start maint
+    start ariaguard
+    start playwatch
+    start power
+service fileweb /system/bin/sh /data/local/tmp/aria2/wait-mount.sh /data/local/tmp/aria2/dufs /mnt/media_rw/FA9E-9466 --bind 0.0.0.0 --port 8777 --allow-all --assets /data/local/tmp/aria2/fileui --hidden .diskinfo.json,.ugoos-backup.new,.control
+    class late_start
+    user shell
+    group shell inet media_rw sdcard_rw everybody external_storage
+    seclabel u:r:shell:s0
+    disabled
+
+# Сторож закачек: не даёт уснуть, пока что-то качается, и по желанию выключает
+# приставку, когда всё докачалось. Работает от root — ему нужен /sys/power/wake_lock
+# и право выключения.
+service dlwatch /system/bin/sh /data/local/tmp/aria2/dlwatch.sh
+    class late_start
+    user root
+    group root
+    seclabel u:r:su:s0
+    disabled
+
+# Сборщик показаний: раз в минуту пишет температуру, качество Wi-Fi, скорость и
+# число соединений в health.log. Нужен, чтобы после сбоя видеть, что ему предшествовало.
+service health /system/bin/sh /data/local/tmp/aria2/health.sh
+    class late_start
+    user root
+    group root
+    seclabel u:r:su:s0
+    disabled
+
+# Обслуживание: раз в неделю кладёт резервную копию настроек на винчестер,
+# раз в сутки просит Kodi выкинуть из медиатеки записи о пропавших файлах.
+# От root: нужен доступ к /system/etc и к базе Kodi.
+service maint /system/bin/sh /data/local/tmp/aria2/maint.sh
+    class late_start
+    user root
+    group root
+    seclabel u:r:su:s0
+    disabled
+
+service ariaguard /system/bin/sh /data/local/tmp/aria2/ariaguard.sh
+    class late_start
+    user root
+    group root
+    seclabel u:r:su:s0
+    disabled
+
+service qbt /system/bin/sh /data/local/tmp/aria2/wait-mount.sh /data/local/tmp/qbt/qbittorrent-nox --profile=/data/local/tmp/qbt/profile
+    class late_start
+    user shell
+    group shell inet media_rw sdcard_rw everybody external_storage
+    seclabel u:r:shell:s0
+    disabled
+
+
+# Монтировщик медиадиска (ext4). Должен стартовать раньше качалки и сторожей:
+# wait-mount.sh ждёт появления папки Download, а появится она только после него.
+# От root: монтирование и проброс в /mnt/user/0 от shell не сделать.
+service extmount /system/bin/sh /data/local/tmp/aria2/extmount.sh
+    class late_start
+    user root
+    seclabel u:r:su:s0
+    disabled
+# Прибор для разбора заминок при просмотре: раз в 5 секунд пишет в play.log дисковую
+# статистику, давление ввода-вывода (PSI) и запас буфера Kodi — но только пока что-то играет.
+# Поставлен 14.09.2026: без дисковых метрик «виноват диск» и «виноват плеер» неразличимы.
+service playwatch /system/bin/sh /data/local/tmp/aria2/playwatch.sh
+    class late_start
+    user root
+    group root
+    seclabel u:r:su:s0
+    disabled
+
+# Кнопки «Перезагрузить» и «Выключить» в файловом менеджере. Вебморда — файловый сервер и команд
+# не выполняет, поэтому кнопка создаёт файл-команду в скрытой папке .control, а этот сторож его
+# подхватывает: штатно закрывает качалку (после kill -9 она перепроверяла бы все раздачи часами)
+# и только потом перезагружает или выключает. От root: нужен reboot.
+service power /system/bin/sh /data/local/tmp/aria2/power.sh
+    class late_start
+    user root
+    group root
+    seclabel u:r:su:s0
+    disabled

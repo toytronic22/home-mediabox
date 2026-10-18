@@ -1,0 +1,27 @@
+# Ключи и пароли — на приставке, не здесь
+tmdb.key
+*.key
+.env
+!*.key.example
+
+# Журналы: содержат имена файлов медиатеки и хеши раздач
+*.log
+
+# Состояние работы
+.held
+.qbt-resume-at
+.last_backup
+.last_clean
+.diskstat.prev
+.orphans.snap
+orphans.state
+dlwatch.pid
+autopoweroff
+.sort.*
+
+# Бинарники: качалка 65 МБ, файловый сервер 5 МБ, HTTP-клиент 6 МБ
+aria2c
+dufs
+qbittorrent-nox
+*.apk
+

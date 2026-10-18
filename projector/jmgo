@@ -1,0 +1,172 @@
+#!/bin/zsh
+set -u
+
+JMGO_IP="${JMGO_IP:-192.168.1.20}"
+JMGO_MDNS_NAME="adb-KD11CN38266700082"
+KEEPER_DIR="/data/local/tmp"
+KODI_GUARD_SRC="${UGOOS_REPO:-$HOME/ugoos-tools/ugoos-mediabox}/projector/kodi-guard.sh"
+KODI_GUARD_LOG="/sdcard/kodi_data/guard/kodi-guard.log"
+export ADB_MDNS_OPENSCREEN=0
+
+usage() {
+  cat <<'EOF'
+Проектор JMGO N5S Ultra Max по adb.
+
+  jmgo               подключиться (и поставить сторожей отладки и Kodi, если их нет)
+  jmgo status        в сети ли проектор, включена ли отладка, живы ли сторожа
+  jmgo kodilog [N]   последние N строк журнала сторожа Kodi (по умолчанию 40)
+  jmgo shell [...]   adb shell на проекторе
+  jmgo adb ...       любая команда adb для проектора (install, push, logcat…)
+EOF
+}
+
+KEEPER_SRC='#!/system/bin/sh
+LOG='"$KEEPER_DIR"'/jmgo-adb-keeper.log
+echo $$ > '"$KEEPER_DIR"'/jmgo-adb-keeper.pid
+while true; do
+  if [ "$(getprop persist.adb.tls_server.enable)" != "1" ]; then
+    bssid=$(cmd wifi status 2>/dev/null | sed -n "s/.*BSSID: \([0-9a-f:]*\),.*/\1/p" | head -1)
+    if [ -n "$bssid" ] && [ "$bssid" != "00:00:00:00:00:00" ] && dumpsys adb 2>/dev/null | grep -qa "$bssid"; then
+      settings put global adb_wifi_enabled 0
+      settings put global adb_wifi_enabled 1
+      echo "$(date "+%F %T") включил отладку, сеть $bssid" >> $LOG
+    fi
+  fi
+  sleep 10
+done
+'
+
+live_serial() {
+  local s
+  for s in $(adb devices 2>/dev/null | awk -v ip="$JMGO_IP" '$1 ~ "^"ip":" {print $1}'); do
+    if [[ "$(adb -s "$s" get-state 2>/dev/null)" == "device" ]]; then
+      print -r -- "$s"; return 0
+    fi
+    adb disconnect "$s" >/dev/null 2>&1
+  done
+  return 1
+}
+
+mdns_addr() {
+  adb mdns services 2>/dev/null | awk -v n="$JMGO_MDNS_NAME" '$1 ~ "^"n && /_adb-tls-connect/ {print $NF; exit}'
+}
+
+ensure_connect() {
+  local s addr i
+  s=$(live_serial) && { print -r -- "$s"; return 0; }
+  for i in 1 2 3 4 5 6; do
+    addr=$(mdns_addr)
+    if [[ "$addr" == *:* ]]; then
+      JMGO_IP="${addr%:*}"
+      adb connect "$addr" >/dev/null 2>&1
+      sleep 1
+      s=$(live_serial) && { print -r -- "$s"; return 0; }
+    fi
+    sleep 3
+  done
+  if ping -c 1 -W 1000 "$JMGO_IP" >/dev/null 2>&1; then
+    {
+      echo "Проектор в сети ($JMGO_IP), но беспроводная отладка выключена."
+      echo "Сторож не работает: проектор перезагружался или его выдёргивали из розетки."
+      echo "Включи один раз «Отладку по сети» в русских настройках (клон) и запусти jmgo — дальше само."
+    } >&2
+  else
+    echo "Проектор не отвечает в сети ($JMGO_IP): спит, выключен или ещё подключается к Wi-Fi." >&2
+  fi
+  return 1
+}
+
+keeper_pid() {
+  adb -s "$1" shell "p=\$(cat $KEEPER_DIR/jmgo-adb-keeper.pid 2>/dev/null); [ -n \"\$p\" ] && grep -q jmgo-adb-keeper /proc/\$p/cmdline 2>/dev/null && echo \$p" 2>/dev/null | tr -d '\r'
+}
+
+ensure_keeper() {
+  local s="$1" p
+  p=$(keeper_pid "$s")
+  [[ -n "$p" ]] && return 0
+  print -r -- "$KEEPER_SRC" | adb -s "$s" shell "cat > $KEEPER_DIR/jmgo-adb-keeper.sh && chmod 755 $KEEPER_DIR/jmgo-adb-keeper.sh"
+  adb -s "$s" shell "setsid nohup sh $KEEPER_DIR/jmgo-adb-keeper.sh >/dev/null 2>&1 </dev/null &"
+  sleep 1
+  p=$(keeper_pid "$s")
+  if [[ -n "$p" ]]; then
+    echo "Сторож отладки запущен на проекторе (pid $p)." >&2
+  else
+    echo "Не удалось запустить сторожа отладки на проекторе." >&2
+    return 1
+  fi
+}
+
+kodi_guard_state() {
+  adb -s "$1" shell "p=\$(cat $KEEPER_DIR/kodi-guard.pid 2>/dev/null); if [ -n \"\$p\" ] && grep -q kodi-guard /proc/\$p/cmdline 2>/dev/null; then echo \$p; else echo -; fi; md5sum $KEEPER_DIR/kodi-guard.sh 2>/dev/null | cut -d' ' -f1" 2>/dev/null | tr -d '\r' | tr '\n' ' '
+}
+
+ensure_kodi_guard() {
+  local s="$1" st p sum want
+  if [[ ! -f "$KODI_GUARD_SRC" ]]; then
+    echo "Сторож Kodi не проверен: нет $KODI_GUARD_SRC" >&2
+    return 0
+  fi
+  want=$(md5 -q "$KODI_GUARD_SRC")
+  st=$(kodi_guard_state "$s")
+  p=${st%% *}; sum=${${st#* }%% *}
+  [[ "$p" != "-" && "$sum" == "$want" ]] && return 0
+  if [[ "$p" != "-" ]]; then
+    adb -s "$s" shell "kill -TERM -$p 2>/dev/null || kill $p; i=0; while [ -d /proc/$p ] && [ \$i -lt 20 ]; do sleep 0.5; i=\$((i + 1)); done" >/dev/null 2>&1
+  fi
+  adb -s "$s" push "$KODI_GUARD_SRC" "$KEEPER_DIR/kodi-guard.sh" >/dev/null 2>&1
+  adb -s "$s" shell "chmod 755 $KEEPER_DIR/kodi-guard.sh; setsid nohup sh $KEEPER_DIR/kodi-guard.sh >/dev/null 2>&1 </dev/null &"
+  sleep 1
+  st=$(kodi_guard_state "$s")
+  p=${st%% *}
+  if [[ "$p" != "-" ]]; then
+    echo "Сторож Kodi запущен на проекторе (pid $p)." >&2
+  else
+    echo "Не удалось запустить сторожа Kodi на проекторе." >&2
+    return 1
+  fi
+}
+
+cmd="${1:-connect}"
+[[ $# -gt 0 ]] && shift
+case "$cmd" in
+  -h|--help|help) usage ;;
+  connect)
+    s=$(ensure_connect) || exit 1
+    ensure_keeper "$s"
+    ensure_kodi_guard "$s"
+    echo "Подключён: $s"
+    ;;
+  status)
+    if s=$(ensure_connect); then
+      p=$(keeper_pid "$s")
+      echo "Подключён: $s"
+      if [[ -n "$p" ]]; then echo "Сторож отладки: работает, pid $p"; else echo "Сторож отладки: не запущен (запусти jmgo)"; fi
+      adb -s "$s" shell "tail -n 5 $KEEPER_DIR/jmgo-adb-keeper.log 2>/dev/null" | sed 's/^/  /'
+      ensure_kodi_guard "$s"
+      st=$(kodi_guard_state "$s")
+      echo "Сторож Kodi: pid ${st%% *}, журнал $KODI_GUARD_LOG"
+      adb -s "$s" shell "tail -n 5 $KODI_GUARD_LOG 2>/dev/null" | sed 's/^/  /'
+    else
+      exit 1
+    fi
+    ;;
+  kodilog)
+    s=$(ensure_connect) || exit 1
+    ensure_keeper "$s"
+    ensure_kodi_guard "$s"
+    adb -s "$s" shell "tail -n ${1:-40} $KODI_GUARD_LOG 2>/dev/null"
+    ;;
+  shell)
+    s=$(ensure_connect) || exit 1
+    ensure_keeper "$s"
+    ensure_kodi_guard "$s"
+    adb -s "$s" shell "$@"
+    ;;
+  adb)
+    s=$(ensure_connect) || exit 1
+    ensure_keeper "$s"
+    ensure_kodi_guard "$s"
+    adb -s "$s" "$@"
+    ;;
+  *) usage >&2; exit 2 ;;
+esac
